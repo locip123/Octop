@@ -124,6 +124,7 @@ class Gateway:
         self._cli_channel: CliChannel | None = None
         self._runtime_status: dict[str, ChannelRuntimeStatus] = {}
         self._history_backfill = HistoryBackfillQueue()
+        self._channel_registration_lock = asyncio.Lock()
 
     def replace_repos(self, repos: RepoBundle) -> None:
         """Point channel/thread persistence at a rebound control-plane pool."""
@@ -414,7 +415,21 @@ class Gateway:
         session = self.require_session(agent_id, session_key)
         manager = self._require_channel_manager()
         channel_id = self._channel_id_for_session(session)
+        if not ThreadRegistry.is_virtual_channel(session.channel_type):
+            await self._ensure_im_channel_registered(channel_id)
         await manager.run_in_session(channel_id, session_key, operation)
+
+    async def _ensure_im_channel_registered(self, channel_id: str) -> None:
+        """Start a missing persisted IM channel before delivering to it."""
+        manager = self._require_channel_manager()
+        if manager.get_channel(channel_id) is not None:
+            return
+        async with self._channel_registration_lock:
+            if manager.get_channel(channel_id) is not None:
+                return
+            row = self._repos.channel_repo.get(channel_id)
+            if row is not None and row.enabled:
+                await self._safe_register_channel(row)
 
     async def push_text_from_session(
         self,
